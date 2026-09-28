@@ -437,6 +437,9 @@ function handleRejectRequest(requestId, userId, username, callbackId, tgMessage)
 // 3. Google Forms Submit & Parsing
 // ============================================================
 
+// ============================================================
+// ОБРАБОТЧИК ФОРМ (АДМИН И СТУДЕНТ)
+// ============================================================
 function onFormSubmit(e) {
   try {
     if (!e) return;
@@ -447,11 +450,15 @@ function onFormSubmit(e) {
       const sheetName = (e.range && e.range.getSheet) ? e.range.getSheet().getName() : '';
       const answers = parseFormAnswers(e);
 
-      if (sheetName === 'Team' || sheetName.includes('Team')) {
+      // Определяем форму по полям или имени листа
+      if (answers.team_name || sheetName.includes('Team') || sheetName.includes('Команд')) {
+        // Форма создания команды студентом
         handleTeamFormSubmission(answers);
-      } else if (sheetName === 'Проекты' || sheetName.includes('Проект')) {
+      } else if (answers.project_name || sheetName.includes('Проект')) {
+        // Форма создания проекта админом
         handleProjectCreationSubmission(answers, sheetName);
-      } else if (sheetName === 'ADD HW' || sheetName.includes('HW')) {
+      } else if (answers.task || sheetName.includes('HW') || sheetName.includes('ДЗ')) {
+        // Форма добавления ДЗ
         handleHomeworkSubmission(answers);
       }
 
@@ -462,6 +469,110 @@ function onFormSubmit(e) {
     }
   } catch (err) {
     Logger.log('❌ Ошибка в onFormSubmit: ' + err.toString());
+  }
+}
+
+// ============================================================
+// ВЫДАЧА ДАННЫХ ДЛЯ САЙТА
+// ============================================================
+function getProjectsForWebsite() {
+  try {
+    const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+    let targetSheet = ss.getSheetByName(SHEET_NAMES.studentProjects);
+    let isStudentProjects = true;
+
+    if (!targetSheet || targetSheet.getLastRow() < 2) {
+      targetSheet = ss.getSheetByName(SHEET_NAMES.projects);
+      isStudentProjects = false;
+    }
+    if (!targetSheet) return [];
+
+    const rows = targetSheet.getDataRange().getValues();
+    const result = [];
+    const timeZone = Session.getScriptTimeZone();
+
+    for (let i = 1; i < rows.length; i++) {
+      if (!rows[i][0] && !rows[i][1]) continue;
+
+      const firstCell = String(rows[i][0] || '').trim();
+      if (firstCell.includes('.') && firstCell.includes(':')) continue;
+
+      let pId, pName, subject, maxCap, curCount, leaderTg, members, deadline, status;
+
+      if (isStudentProjects) {
+        // Порядок столбцов листа Student_Projects из вашего скриншота:
+        // A(0): Team_ID | B(1): Team_Name | C(2): Subject | D(3): Parent_Project_ID
+        // E(4): Max_Capacity | F(5): Current_Count | G(6): Leader_TG | H(7): Members
+        // I(8): Deadline | J(9): Status
+        pId = String(rows[i][0] || '').trim();
+        pName = String(rows[i][1] || '').trim();
+        subject = String(rows[i][2] || '').trim();
+        maxCap = Number(rows[i][4]) || 0;
+        curCount = Number(rows[i][5]) || 0;
+        leaderTg = String(rows[i][6] || '').trim().replace(/^@/, '');
+        members = String(rows[i][7] || '').trim();
+
+        let rawDeadline = rows[i][8];
+        if (rawDeadline instanceof Date) {
+          deadline = Utilities.formatDate(rawDeadline, timeZone, 'dd.MM.yyyy');
+        } else {
+          deadline = String(rawDeadline || '').trim();
+        }
+
+        status = String(rows[i][9] || 'Active').trim().toLowerCase();
+      } else {
+        // Структура листа Projects (9 колонок):
+        pId = String(rows[i][0] || '').trim();
+        pName = String(rows[i][1] || '').trim();
+        subject = String(rows[i][2] || '').trim();
+        maxCap = Number(rows[i][3]) || 0;
+        curCount = Number(rows[i][4]) || 0;
+        leaderTg = String(rows[i][5] || '').trim().replace(/^@/, '');
+        members = String(rows[i][6] || '').trim();
+
+        let rawDeadline = rows[i][7];
+        if (rawDeadline instanceof Date) {
+          deadline = Utilities.formatDate(rawDeadline, timeZone, 'dd.MM.yyyy');
+        } else {
+          deadline = String(rawDeadline || '').trim();
+        }
+
+        status = String(rows[i][8] || 'Active').trim().toLowerCase();
+      }
+
+      if (['closed', 'expired', 'archived', 'inactive'].includes(status)) continue;
+
+      const availSpots = Math.max(0, maxCap - curCount);
+
+      // Передаем полные ключи (и camelCase, и snake_case) под любой скрипт верстки сайта
+      result.push({
+        projectId: pId,
+        project_id: pId,
+        projectName: pName,
+        project_name: pName,
+        teamName: pName,
+        team_name: pName,
+        subject: subject,
+        maxCapacity: maxCap,
+        max_capacity: maxCap,
+        currentCount: curCount,
+        current_count: curCount,
+        availableSpots: availSpots,
+        available_spots: availSpots,
+        leaderTelegramId: leaderTg,
+        leader_tg: leaderTg,
+        leader: leaderTg,
+        approvedMembers: members,
+        members: members,
+        deadline: deadline,
+        status: status
+      });
+    }
+
+    return result;
+  } catch (error) {
+    Logger.log('❌ Ошибка getProjectsForWebsite: ' + error.toString());
+    return [];
   }
 }
 
@@ -654,14 +765,19 @@ function handleJoinRequestSubmission(answers) {
 function getProjectsForWebsite() {
   try {
     const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+    
     let targetSheet = ss.getSheetByName(SHEET_NAMES.studentProjects);
+    let isStudentProjects = true;
+
     if (!targetSheet || targetSheet.getLastRow() < 2) {
       targetSheet = ss.getSheetByName(SHEET_NAMES.projects);
+      isStudentProjects = false;
     }
     if (!targetSheet) return [];
 
     const rows = targetSheet.getDataRange().getValues();
     const result = [];
+    const timeZone = Session.getScriptTimeZone();
 
     for (let i = 1; i < rows.length; i++) {
       if (!rows[i][0] && !rows[i][1]) continue;
@@ -669,22 +785,76 @@ function getProjectsForWebsite() {
       const firstCell = String(rows[i][0] || '').trim();
       if (firstCell.includes('.') && firstCell.includes(':')) continue;
 
-      const status = String(rows[i][9] || rows[i][8] || 'Active').trim().toLowerCase();
-      if (status === 'closed' || status === 'expired' || status === 'archived' || status === 'inactive') continue;
+      let pId, pName, subject, maxCap, curCount, leaderTg, members, deadline, status;
 
-      const maxCapacity = Number(rows[i][4]) || Number(rows[i][3]) || 0;
-      const currentCount = Number(rows[i][5]) || Number(rows[i][4]) || 0;
+      if (isStudentProjects) {
+        // Лист Student_Projects (структура из вашего скриншота):
+        // A(0): Team_ID | B(1): Team_Name | C(2): Subject | D(3): Parent_Project_ID
+        // E(4): Max_Capacity | F(5): Current_Count | G(6): Leader_TG | H(7): Members
+        // I(8): Deadline | J(9): Status
+        pId = String(rows[i][0] || '').trim();
+        pName = String(rows[i][1] || '').trim();
+        subject = String(rows[i][2] || '').trim();
+        maxCap = Number(rows[i][4]) || 0;
+        curCount = Number(rows[i][5]) || 0;
+        leaderTg = String(rows[i][6] || '').trim().replace(/^@/, '');
+        members = String(rows[i][7] || '').trim();
+        
+        let rawDeadline = rows[i][8];
+        if (rawDeadline instanceof Date) {
+          deadline = Utilities.formatDate(rawDeadline, timeZone, 'dd.MM.yyyy');
+        } else {
+          deadline = String(rawDeadline || '').trim();
+        }
 
+        status = String(rows[i][9] || 'Active').trim().toLowerCase();
+      } else {
+        // Лист Projects (9 колонок):
+        // A(0): Project_ID | B(1): Project_Name | C(2): Subject | D(3): Max_Capacity
+        // E(4): Current_Count | F(5): Leader_TG | G(6): Members | H(7): Deadline | I(8): Status
+        pId = String(rows[i][0] || '').trim();
+        pName = String(rows[i][1] || '').trim();
+        subject = String(rows[i][2] || '').trim();
+        maxCap = Number(rows[i][3]) || 0;
+        curCount = Number(rows[i][4]) || 0;
+        leaderTg = String(rows[i][5] || '').trim().replace(/^@/, '');
+        members = String(rows[i][6] || '').trim();
+
+        let rawDeadline = rows[i][7];
+        if (rawDeadline instanceof Date) {
+          deadline = Utilities.formatDate(rawDeadline, timeZone, 'dd.MM.yyyy');
+        } else {
+          deadline = String(rawDeadline || '').trim();
+        }
+
+        status = String(rows[i][8] || 'Active').trim().toLowerCase();
+      }
+
+      if (['closed', 'expired', 'archived', 'inactive'].includes(status)) continue;
+
+      const availSpots = Math.max(0, maxCap - curCount);
+
+      // Сохраняем поля и в camelCase, и в snake_case для полной совместимости с фронтендом
       result.push({
-        projectId: String(rows[i][0] || '').trim(),
-        projectName: String(rows[i][1] || '').trim(),
-        subject: String(rows[i][2] || '').trim(),
-        maxCapacity: maxCapacity,
-        currentCount: currentCount,
-        leaderTelegramId: String(rows[i][6] || rows[i][5] || '').trim(),
-        approvedMembers: String(rows[i][7] || rows[i][6] || '').trim(),
-        deadline: String(rows[i][8] || rows[i][7] || '').trim(),
-        availableSpots: Math.max(0, maxCapacity - currentCount),
+        projectId: pId,
+        project_id: pId,
+        projectName: pName,
+        project_name: pName,
+        teamName: pName,
+        team_name: pName,
+        subject: subject,
+        maxCapacity: maxCap,
+        max_capacity: maxCap,
+        currentCount: curCount,
+        current_count: curCount,
+        availableSpots: availSpots,
+        available_spots: availSpots,
+        leaderTelegramId: leaderTg,
+        leader_tg: leaderTg,
+        leader: leaderTg,
+        approvedMembers: members,
+        members: members,
+        deadline: deadline,
         status: status
       });
     }
@@ -695,6 +865,7 @@ function getProjectsForWebsite() {
     return [];
   }
 }
+
 
 function processUserQuery(userMessage) {
   try {
