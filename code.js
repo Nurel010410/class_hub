@@ -1,15 +1,18 @@
 // ============================================================
 // CLASS HUB — Google Apps Script (Telegram + Google Forms + Sheets)
 // ============================================================
-// Цель: связать Telegram-бот, Google Таблицу и Google Формы,
-// обеспечить обработку текстовых вопросов, заявок и админских сценариев,
-// а также безопасно отправлять уведомления через Telegram API.
-// ============================================================
 
 const BOT_TOKEN = '8727223928:AAHCu-jJhFWmyqY4r0iUPWOJD445SbZNa9o';
 const SPREADSHEET_ID = '1ygTKJmW_9GWwPspc1RY2yJjvfI8WT5XsFf2NNZuAT_M';
 const WEBHOOK_URL = 'https://class-hub.nureldinmuhamedov010410.workers.dev/';
 const WEBHOOK_SECRET = '1234899384';
+
+
+const TELEGRAM_CHAT_ID = '-1004379161096'; // ID супергруппы Telegram
+
+// ID топиков (веток) форума в вашей группе Telegram:
+const TELEGRAM_TOPIC_GENERAL = 1;   // ID темы General / Q&A (для ответов и вопросов)
+const TELEGRAM_TOPIC_REQUESTS = 3;  // ID темы для Заявок (сообщения по запросам с сайта/формы)
 
 const SHEET_NAMES = {
   projects: 'Projects',
@@ -20,7 +23,8 @@ const SHEET_NAMES = {
   schedule: 'Schedule',
   groups: 'Groups',
   syllabus: 'Syllabus',
-  studentProjects: 'Student_Projects'
+  studentProjects: 'Student_Projects',
+  responses: 'Form Responses 1'
 };
 
 const FORM_TITLES = {
@@ -30,7 +34,8 @@ const FORM_TITLES = {
 };
 
 const CONFIG = {
-  TEAM_FORM_ID: '1ygTKJmW_9GWwPspc1RY2yJjvfI8WT5XsFf2NNZuAT_M',
+  TEAM_FORM_ID: '1PCasYaKY3YepLZrwjBA272-kUZa4bDlVGThxP4mZ1b4',
+  PROJECT_QUESTION_TITLE: 'Выберите проект',
   SHEETS: {
     DEADLINES: 'Deadlines',
     PROJECTS: 'Projects',
@@ -40,63 +45,90 @@ const CONFIG = {
   }
 };
 
-const SCHEDULE_ANCHOR_MONDAY = '2026-09-07';
-const SCHEDULE_ANCHOR_WEEK_TYPE = 1;
-const DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-
 // ============================================================
-// 1. WEBHOOK / doPost / Telegram message processing
+// 1. WEBHOOK / doPost / doGet
 // ============================================================
 
 function doPost(e) {
   try {
     if (!e || !e.postData || !e.postData.contents) {
-      Logger.log('⚠️ Пустой POST запрос');
       return HtmlService.createHtmlOutput('No data');
     }
 
     const data = JSON.parse(e.postData.contents);
 
+    // 1. Webhook от Telegram бота
     if (data.message) {
       handleTextMessage(data.message);
-    } else if (data.callback_query) {
+      return HtmlService.createHtmlOutput('OK');
+    } 
+    if (data.callback_query) {
       handleTelegramCallbackQuery(data.callback_query);
-    } else if (data.action === 'addProject') {
-      handleWebsiteProjectRequest(data);
+      return HtmlService.createHtmlOutput('OK');
+    } 
+
+    // 2. Заявка с сайта на вступление в существующую команду
+    if (data.action === 'joinProjectRequest' || data.action === 'join_request' || data.projectId) {
+      handleJoinRequestSubmission({
+        project_id: data.projectId || data.project_id || '',
+        student_name: data.studentName || data.student_name || data.name || 'Участник',
+        student_tg: data.studentId || data.student_tg || data.telegram || ''
+      });
+      return ContentService.createTextOutput(JSON.stringify({ status: 'success', message: 'Заявка отправлена' }))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
+
+    // 3. Вопрос с сайта в ветку General
+    if (data.action === 'general_question') {
+      sendTelegramNotification(`❓ <b>Вопрос с сайта:</b> ${data.question}`, TELEGRAM_TOPIC_GENERAL);
+      return ContentService.createTextOutput(JSON.stringify({ status: 'success', message: 'Вопрос отправлен' }))
+        .setMimeType(ContentService.MimeType.JSON);
     }
 
     return HtmlService.createHtmlOutput('OK');
+
   } catch (error) {
     Logger.log('❌ Ошибка doPost: ' + error.toString());
-    return HtmlService.createHtmlOutput('ERROR');
+    return ContentService.createTextOutput(JSON.stringify({ status: 'error', message: error.toString() }))
+      .setMimeType(ContentService.MimeType.JSON);
   }
 }
 function doGet(e) {
   try {
-    const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
-    const sheet = ss.getSheetByName(SHEET_NAMES.projects); // Проверьте, что имя листа совпадает 1 в 1!
-    
-    if (!sheet) {
-      return ContentService.createTextOutput(JSON.stringify({
-        status: "error",
-        message: "Лист не найден"
-      })).setMimeType(ContentService.MimeType.JSON);
+    const action = (e && e.parameter && e.parameter.action) || 'getAll';
+
+    // Запрос конкретной вкладки
+    if (action === 'getProjects') {
+      return createJsonResponse({ status: 'success', data: getProjectsForWebsite() });
+    }
+    if (action === 'getDeadlines') {
+      return createJsonResponse({ status: 'success', data: getDeadlinesForWebsite() });
+    }
+    if (action === 'getSyllabus') {
+      return createJsonResponse({ status: 'success', data: getSheetData(SHEET_NAMES.syllabus) });
     }
 
-    const data = sheet.getDataRange().getValues();
-    // Дальнейшая сборка JSON...
-
-    return ContentService.createTextOutput(JSON.stringify(projects))
-      .setMimeType(ContentService.MimeType.JSON);
+    // По умолчанию возвращаем ВСЕ данные одновременно для всех вкладок сайта
+    return createJsonResponse({
+      status: 'success',
+      projects: getProjectsForWebsite(),
+      deadlines: getDeadlinesForWebsite(),
+      syllabus: getSheetData(SHEET_NAMES.syllabus)
+    });
 
   } catch (err) {
-    // ЗАЩИТА ОТ ПАДЕНИЯ: возвращаем ошибку в JSON, а не ломаем выполнение
-    return ContentService.createTextOutput(JSON.stringify({
-      status: "error",
-      error: err.toString()
-    })).setMimeType(ContentService.MimeType.JSON);
+    return createJsonResponse({ status: 'error', error: err.toString() });
   }
 }
+
+function createJsonResponse(data) {
+  return ContentService.createTextOutput(JSON.stringify(data))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+// ============================================================
+// 2. Telegram message & Callback handlers
+// ============================================================
 
 function handleTextMessage(message) {
   try {
@@ -123,40 +155,98 @@ function handleTextMessage(message) {
   } catch (error) {
     Logger.log('❌ Ошибка handleTextMessage: ' + error.toString());
     if (message && message.chat && message.chat.id) {
-      sendTelegramMessage(message.chat.id, '❌ Произошла ошибка при обработке запроса. Попробуйте позже.');
+      sendTelegramMessage(message.chat.id, '❌ Произошла ошибка при обработке запроса.');
     }
   }
 }
 
 function handleTelegramCallbackQuery(callbackQuery) {
   try {
-    if (!callbackQuery || !callbackQuery.data) {
-      return;
-    }
+    if (!callbackQuery || !callbackQuery.data) return;
 
     const callbackId = callbackQuery.id;
-    const userId = String(callbackQuery.from && callbackQuery.from.id || '');
+    const user = callbackQuery.from || {};
+    const userId = String(user.id || '');
+    const username = String(user.username || '').replace(/^@/, '').toLowerCase();
     const data = callbackQuery.data;
+    const telegramMessage = callbackQuery.message || null;
 
     if (data.indexOf('app_') === 0) {
-      const requestId = data.replace(/^app_/, '');
-      handleApproveRequest(requestId, userId, callbackId);
+      handleApproveRequest(data.replace(/^app_/, ''), userId, username, callbackId, telegramMessage);
       return;
     }
 
     if (data.indexOf('rej_') === 0) {
-      const requestId = data.replace(/^rej_/, '');
-      handleRejectRequest(requestId, userId, callbackId);
+      handleRejectRequest(data.replace(/^rej_/, ''), userId, username, callbackId, telegramMessage);
       return;
     }
 
-    answerCallbackQuery(callbackId, 'Неизвестный action', true);
+    answerCallbackQuery(callbackId, 'Неизвестное действие', true);
   } catch (error) {
     Logger.log('❌ Ошибка handleTelegramCallbackQuery: ' + error.toString());
   }
 }
 
-function handleApproveRequest(requestId, userId, callbackId) {
+function getProjectColumnMap(sheet) {
+  const headers = sheet.getLastColumn()
+    ? sheet.getRange(1, 1, 1, sheet.getLastColumn()).getDisplayValues()[0]
+      .map(value => String(value).trim().toLowerCase().replace(/[^a-z0-9]+/g, '_'))
+    : [];
+  const isTeamSchema = sheet.getName() === SHEET_NAMES.studentProjects &&
+    (headers.includes('team_id') || headers.includes('parent_project_id'));
+
+  if (isTeamSchema) {
+    return {
+      id: 0, name: 1, subject: 2, parentProjectId: 3, maxCapacity: 4,
+      currentCount: 5, leader: 6, members: 7, deadline: 8, status: 9,
+      teamSchema: true
+    };
+  }
+
+  return {
+    id: 0, name: 1, subject: 2, parentProjectId: -1, maxCapacity: 3,
+    currentCount: 4, leader: 5, members: 6, deadline: 7, status: 8,
+    teamSchema: false
+  };
+}
+
+function findProjectRowById(ss, projectId) {
+  for (const sheetName of [SHEET_NAMES.studentProjects, SHEET_NAMES.projects]) {
+    const sheet = ss.getSheetByName(sheetName);
+    if (!sheet) continue;
+
+    const values = sheet.getDataRange().getValues();
+    const columns = getProjectColumnMap(sheet);
+    for (let row = 1; row < values.length; row++) {
+      if (String(values[row][columns.id] || '').trim().toLowerCase() ===
+          String(projectId || '').trim().toLowerCase()) {
+        return { sheet: sheet, values: values, columns: columns, row: row };
+      }
+    }
+  }
+  return null;
+}
+
+function isUserAuthorized(userId, username, leaderTelegramId) {
+  const cleanUsername = String(username || '').replace(/^@/, '').trim().toLowerCase();
+  const cleanUserId = String(userId || '').trim().toLowerCase();
+  const cleanLeader = String(leaderTelegramId || '').replace(/^@/, '').trim().toLowerCase();
+
+  if (cleanLeader && (cleanLeader === cleanUsername || cleanLeader === cleanUserId)) {
+    return true;
+  }
+
+  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const adminSheet = ss.getSheetByName(SHEET_NAMES.adminIds);
+  if (!adminSheet) return false;
+
+  const admins = adminSheet.getDataRange().getValues().flat()
+    .map(value => String(value).replace(/^@/, '').trim().toLowerCase())
+    .filter(Boolean);
+  return admins.includes(cleanUsername) || admins.includes(cleanUserId);
+}
+
+function handleApproveRequest(requestId, userId, username, callbackId, tgMessage) {
   try {
     const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
     const lock = LockService.getScriptLock();
@@ -167,7 +257,8 @@ function handleApproveRequest(requestId, userId, callbackId) {
 
     try {
       const joinSheet = ss.getSheetByName(SHEET_NAMES.joinRequests);
-      const projectsSheet = ss.getSheetByName(SHEET_NAMES.projects);
+      const projectsSheet = ss.getSheetByName(SHEET_NAMES.studentProjects) ||
+        ss.getSheetByName(SHEET_NAMES.projects);
 
       if (!joinSheet || !projectsSheet) {
         answerCallbackQuery(callbackId, 'Лист заявки или проекта не найден.', true);
@@ -175,19 +266,16 @@ function handleApproveRequest(requestId, userId, callbackId) {
       }
 
       const joinData = joinSheet.getDataRange().getValues();
-      const projectsData = projectsSheet.getDataRange().getValues();
 
       let requestRow = -1;
       let projectId = '';
       let studentTelegramId = '';
-      let studentName = '';
 
       for (let i = 1; i < joinData.length; i++) {
         if (String(joinData[i][0]).trim() === String(requestId).trim()) {
           requestRow = i;
           projectId = String(joinData[i][1] || '').trim();
           studentTelegramId = String(joinData[i][2] || '').trim();
-          studentName = String(joinData[i][3] || '').trim();
           break;
         }
       }
@@ -196,32 +284,27 @@ function handleApproveRequest(requestId, userId, callbackId) {
         answerCallbackQuery(callbackId, 'Заявка не найдена.', true);
         return;
       }
-
-      let projectRow = -1;
-      let leaderTelegramId = '';
-      let projectName = '';
-      let maxCapacity = 0;
-      let currentCount = 0;
-      let approvedMembers = '';
-
-      for (let i = 1; i < projectsData.length; i++) {
-        if (String(projectsData[i][0]).trim() === String(projectId).trim()) {
-          projectRow = i;
-          leaderTelegramId = String(projectsData[i][5] || '').trim();
-          projectName = String(projectsData[i][1] || '').trim();
-          maxCapacity = Number(projectsData[i][3]) || 0;
-          currentCount = Number(projectsData[i][4]) || 0;
-          approvedMembers = String(projectsData[i][6] || '').trim();
-          break;
-        }
-      }
-
-      if (projectRow === -1) {
-        answerCallbackQuery(callbackId, 'Проект не найден.', true);
+      const requestStatus = String(joinData[requestRow][4] || '').trim().toLowerCase();
+      if (requestStatus === 'approved' || requestStatus === 'rejected') {
+        answerCallbackQuery(callbackId, 'Заявка уже обработана.', true);
         return;
       }
 
-      if (String(leaderTelegramId) !== String(userId)) {
+      const project = findProjectRowById(ss, projectId);
+      if (!project) {
+        answerCallbackQuery(callbackId, 'Проект не найден.', true);
+        return;
+      }
+      const columns = project.columns;
+      const projectRow = project.row;
+      const projectData = project.values[projectRow];
+      const leaderTelegramId = String(projectData[columns.leader] || '').trim();
+      const projectName = String(projectData[columns.name] || '').trim();
+      const maxCapacity = Number(projectData[columns.maxCapacity]) || 0;
+      const currentCount = Number(projectData[columns.currentCount]) || 0;
+      const approvedMembers = String(projectData[columns.members] || '').trim();
+
+      if (!isUserAuthorized(userId, username, leaderTelegramId)) {
         answerCallbackQuery(callbackId, 'У вас нет права подтверждать эту заявку.', true);
         return;
       }
@@ -236,9 +319,15 @@ function handleApproveRequest(requestId, userId, callbackId) {
         members.push(studentTelegramId);
       }
 
-      projectsSheet.getRange(projectRow + 1, 5).setValue(members.length);
-      projectsSheet.getRange(projectRow + 1, 7).setValue(members.join(', '));
+      project.sheet.getRange(projectRow + 1, columns.currentCount + 1).setValue(members.length);
+      project.sheet.getRange(projectRow + 1, columns.members + 1).setValue(members.join(', '));
       joinSheet.getRange(requestRow + 1, 5).setValue('Approved');
+
+      sendTelegramNotification(
+        `✅ <b>Заявка ${requestId} принята!</b>\n` +
+        `👤 Участник <b>@${esc(studentTelegramId)}</b> добавлен в команду <b>${esc(projectName)}</b>.`,
+        TELEGRAM_TOPIC_REQUESTS
+      );
 
       sendTelegramMessage(
         studentTelegramId,
@@ -248,48 +337,53 @@ function handleApproveRequest(requestId, userId, callbackId) {
       );
 
       answerCallbackQuery(callbackId, '✅ Заявка подтверждена', false);
-      Logger.log('✅ Заявка ' + requestId + ' одобрена.');
+      if (tgMessage && tgMessage.chat && tgMessage.message_id) {
+        const actor = username ? '@' + username : userId;
+        editTelegramMessage(
+          tgMessage.chat.id,
+          tgMessage.message_id,
+          (tgMessage.text || '') + '\n\n✅ <b>ПРИНЯТО</b> (Обработал: ' + esc(actor) + ')'
+        );
+      }
     } finally {
       lock.releaseLock();
     }
   } catch (error) {
     Logger.log('❌ Ошибка handleApproveRequest: ' + error.toString());
-    answerCallbackQuery(callbackId, 'Ошибка при approval', true);
+    answerCallbackQuery(callbackId, 'Ошибка при подтверждении', true);
   }
 }
 
-function handleRejectRequest(requestId, userId, callbackId) {
+function handleRejectRequest(requestId, userId, username, callbackId, tgMessage) {
   try {
     const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
     const lock = LockService.getScriptLock();
     if (!lock.tryLock(10000)) {
-      answerCallbackQuery(callbackId, 'Операция занята. Попробуйте позже.', true);
+      answerCallbackQuery(callbackId, 'Операция занята.', true);
       return;
     }
 
     try {
       const joinSheet = ss.getSheetByName(SHEET_NAMES.joinRequests);
-      const projectsSheet = ss.getSheetByName(SHEET_NAMES.projects);
+      const projectsSheet = ss.getSheetByName(SHEET_NAMES.studentProjects) ||
+        ss.getSheetByName(SHEET_NAMES.projects);
 
       if (!joinSheet || !projectsSheet) {
-        answerCallbackQuery(callbackId, 'Лист заявки или проекта не найден.', true);
+        answerCallbackQuery(callbackId, 'Таблицы не найдены.', true);
         return;
       }
 
       const joinData = joinSheet.getDataRange().getValues();
-      const projectsData = projectsSheet.getDataRange().getValues();
 
       let requestRow = -1;
       let projectId = '';
       let studentTelegramId = '';
-      let studentName = '';
 
       for (let i = 1; i < joinData.length; i++) {
         if (String(joinData[i][0]).trim() === String(requestId).trim()) {
           requestRow = i;
           projectId = String(joinData[i][1] || '').trim();
           studentTelegramId = String(joinData[i][2] || '').trim();
-          studentName = String(joinData[i][3] || '').trim();
           break;
         }
       }
@@ -299,25 +393,21 @@ function handleRejectRequest(requestId, userId, callbackId) {
         return;
       }
 
-      let projectRow = -1;
-      let leaderTelegramId = '';
-      let projectName = '';
-
-      for (let i = 1; i < projectsData.length; i++) {
-        if (String(projectsData[i][0]).trim() === String(projectId).trim()) {
-          projectRow = i;
-          leaderTelegramId = String(projectsData[i][5] || '').trim();
-          projectName = String(projectsData[i][1] || '').trim();
-          break;
-        }
-      }
-
-      if (projectRow === -1) {
-        answerCallbackQuery(callbackId, 'Проект не найден.', true);
+      const requestStatus = String(joinData[requestRow][4] || '').trim().toLowerCase();
+      if (requestStatus === 'approved' || requestStatus === 'rejected') {
+        answerCallbackQuery(callbackId, 'Заявка уже обработана.', true);
         return;
       }
 
-      if (String(leaderTelegramId) !== String(userId)) {
+      const project = findProjectRowById(ss, projectId);
+      const projectName = project
+        ? String(project.values[project.row][project.columns.name] || '').trim()
+        : '';
+      const leaderTelegramId = project
+        ? String(project.values[project.row][project.columns.leader] || '').trim()
+        : '';
+
+      if (!project || !isUserAuthorized(userId, username, leaderTelegramId)) {
         answerCallbackQuery(callbackId, 'У вас нет права отклонять эту заявку.', true);
         return;
       }
@@ -327,241 +417,438 @@ function handleRejectRequest(requestId, userId, callbackId) {
       sendTelegramMessage(
         studentTelegramId,
         '❌ <b>Ваша заявка отклонена</b>\n\n' +
-        'Проект: <b>' + esc(projectName) + '</b>\n' +
-        'Лидер отклонил вашу заявку.'
+        'Проект: <b>' + esc(projectName) + '</b>'
       );
 
       answerCallbackQuery(callbackId, '✅ Заявка отклонена', false);
-      Logger.log('❌ Заявка ' + requestId + ' отклонена.');
+      if (tgMessage && tgMessage.chat && tgMessage.message_id) {
+        const actor = username ? '@' + username : userId;
+        editTelegramMessage(
+          tgMessage.chat.id,
+          tgMessage.message_id,
+          (tgMessage.text || '') + '\n\n❌ <b>ОТКЛОНЕНО</b> (Обработал: ' + esc(actor) + ')'
+        );
+      }
+      sendTelegramNotification(
+        `❌ Заявка <code>${esc(requestId)}</code> на проект <b>${esc(projectName)}</b> отклонена.`,
+        TELEGRAM_TOPIC_REQUESTS
+      );
     } finally {
       lock.releaseLock();
     }
   } catch (error) {
     Logger.log('❌ Ошибка handleRejectRequest: ' + error.toString());
-    answerCallbackQuery(callbackId, 'Ошибка при rejection', true);
+    answerCallbackQuery(callbackId, 'Ошибка при отклонении', true);
   }
 }
 
 // ============================================================
-// 2. Google Forms processing
+// 3. Google Forms & Sheets triggers
+// ============================================================
+
+// ============================================================
+// ОБРАБОТКА И ПЕРЕНОС ДЗ В DEADLINES И HOMEWORK_POOL
 // ============================================================
 
 function onFormSubmit(e) {
   try {
-    if (!e || !e.source) return;
+    if (!e) return;
+    const lock = LockService.getScriptLock();
+    if (!lock.tryLock(10000)) return;
 
-    const form = FormApp.openById(e.source.getId());
-    const title = form.getTitle();
+    try {
+      const sheetName = (e.range && e.range.getSheet) ? e.range.getSheet().getName() : '';
+      const answers = parseFormAnswers(e);
 
-    Logger.log('📋 Получена форма: ' + title);
+      // Форма 1: Создание КОМАНДЫ студентами (Форма Team)
+      if (sheetName === 'Team' || sheetName.includes('Team')) {
+        handleTeamFormSubmission(answers);
+      } 
+      // Форма 2: Создание ТЕМЫ ПРОЕКТА админом (Форма Проекты)
+      else if (sheetName === 'Проекты' || sheetName.includes('Проект')) {
+        handleProjectCreationSubmission(answers, sheetName);
+      } 
+      // Форма 3: Добавление ДЗ (Форма ADD HW)
+      else if (sheetName === 'ADD HW' || sheetName.includes('HW')) {
+        handleHomeworkSubmission(answers);
+      }
 
-    if (title.indexOf(FORM_TITLES.adminForm) !== -1) {
-      handleAdminForm(e);
-    } else if (title.indexOf(FORM_TITLES.studentForm) !== -1) {
-      handleStudentForm(e);
-    } else if (title.indexOf(FORM_TITLES.joinRequestForm) !== -1) {
-      handleJoinRequestForm(e);
+      recalculateProjectCounts();
+      updateFormProjectOptions();
+    } finally {
+      lock.releaseLock();
+    }
+  } catch (err) {
+    Logger.log('❌ Ошибка в onFormSubmit: ' + err.toString());
+  }
+}
+function parseFormAnswers(e) {
+  const result = {
+    project_id: '', project_name: '', team_name: '',
+    student_name: '', student_tg: '', leader_tg: '', subject: '',
+    task: '', deadline: '', max_capacity: '', points: '', link: ''
+  };
+
+  if (!e || !e.namedValues) return result;
+
+  Object.keys(e.namedValues).forEach(key => {
+    const k = key.toLowerCase().trim();
+    const val = String(e.namedValues[key][0] || '').trim();
+
+    if (k.includes('выберите проект') || k.includes('проект')) {
+      const match = val.match(/(PRJ-\d+)/i);
+      if (match) result.project_id = match[1].toUpperCase();
+      if (k.includes('выберите') || !k.includes('код проекта')) result.project_name = val;
+    }
+    if (k.includes('название команды')) result.team_name = val;
+    if (k.includes('название проекта')) result.project_name = val;
+    if (k.includes('предмет') || k.includes('дисциплина')) result.subject = val;
+    if (k.includes('мест') || k.includes('capacity')) result.max_capacity = val;
+    if (k.includes('дедлайн') || k.includes('срок')) result.deadline = val;
+    if (k.includes('задание') || k.includes('описание')) result.task = val;
+    if (k.includes('балл') || k.includes('кредит')) result.points = val;
+    if (k.includes('ссылка') || k.includes('материал')) result.link = val;
+    if (k.includes('telegram') || k.includes('username') || k.includes('id студента')) {
+      const cleanTg = val.replace('@', '').trim();
+      if (k.includes('лидер')) {
+        result.leader_tg = cleanTg;
+      } else if (k.includes('студент') || k.includes('id студента')) {
+        result.student_tg = cleanTg;
+      } else {
+        result.student_tg = cleanTg;
+        result.leader_tg = cleanTg;
+      }
+    }
+    if (k.includes('лидер') && !result.leader_tg) result.leader_tg = val.replace('@', '').trim();
+    if (k.includes('имя') || k.includes('фио')) result.student_name = val;
+    if (k.includes('код проекта')) {
+      const match = val.match(/(PRJ-\d+)/i);
+      if (match) result.project_id = match[1].toUpperCase();
+    }
+  });
+
+  return result;
+}
+
+function handleHomeworkSubmission(answers) {
+  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+  
+  // 1. Запись в Deadlines (Subject, Task, Date, Points, Link)
+  const deadlinesSheet = ss.getSheetByName(SHEET_NAMES.deadlines);
+  if (deadlinesSheet) {
+    deadlinesSheet.appendRow([
+      answers.subject,
+      answers.task,
+      answers.deadline,
+      answers.points,
+      answers.link
+    ]);
+  }
+
+  // 2. Запись в Homework_Pool (ID, Subject, Task_Description, Deadline_Date, Created_At)
+  const hwPoolSheet = ss.getSheetByName(SHEET_NAMES.homeworkPool);
+  if (hwPoolSheet) {
+    const hwId = 'HW-' + String(hwPoolSheet.getLastRow()).padStart(3, '0');
+    const createdAt = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm:ss');
+    hwPoolSheet.appendRow([
+      hwId,
+      answers.subject,
+      answers.task,
+      answers.deadline,
+      createdAt
+    ]);
+  }
+}
+
+// Разовый перенос уже имеющихся ответов из формы
+function syncExistingHomeworkResponses() {
+  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+  
+  // Ищем именно вкладку ADD HW
+  let formSheet = ss.getSheetByName('ADD HW');
+  if (!formSheet) {
+    const sheets = ss.getSheets();
+    for (let s of sheets) {
+      const val = s.getRange(1, 1, 1, Math.min(10, s.getLastColumn())).getValues()[0];
+      const headersStr = val.join(' ').toLowerCase();
+      if (headersStr.includes('задание')) {
+        formSheet = s;
+        break;
+      }
+    }
+  }
+
+  if (!formSheet) {
+    Logger.log('❌ Вкладка с ответами формы ДЗ не найдена!');
+    return;
+  }
+
+  const data = formSheet.getDataRange().getValues();
+  if (data.length < 2) return;
+
+  const headers = data[0].map(h => String(h).toLowerCase().trim());
+
+  let idxSubject = headers.findIndex(h => h.includes('предмет'));
+  if (idxSubject === -1) idxSubject = 1;
+
+  let idxTask = headers.findIndex(h => h.includes('задание') || h.includes('описание'));
+  if (idxTask === -1) idxTask = 2;
+
+  let idxDate = headers.findIndex(h => h.includes('срок') || h.includes('дата') || h.includes('дедлайн'));
+  if (idxDate === -1) idxDate = 3;
+
+  let idxPoints = headers.findIndex(h => h.includes('балл') || h.includes('кредит'));
+  if (idxPoints === -1) idxPoints = 4;
+
+  let idxLink = headers.findIndex(h => h.includes('ссылка') || h.includes('материал'));
+  if (idxLink === -1) idxLink = 5;
+
+  const deadlinesSheet = ss.getSheetByName(SHEET_NAMES.deadlines);
+  const hwPoolSheet = ss.getSheetByName(SHEET_NAMES.homeworkPool);
+
+  // Очищаем старые неполные строки (оставляем заголовки)
+  if (deadlinesSheet && deadlinesSheet.getLastRow() > 1) {
+    deadlinesSheet.getRange(2, 1, deadlinesSheet.getLastRow() - 1, deadlinesSheet.getLastColumn()).clearContent();
+  }
+  if (hwPoolSheet && hwPoolSheet.getLastRow() > 1) {
+    hwPoolSheet.getRange(2, 1, hwPoolSheet.getLastRow() - 1, hwPoolSheet.getLastColumn()).clearContent();
+  }
+
+  // Заполняем таблицы правильными данными
+  let hwCounter = 1;
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    const subject = String(row[idxSubject] || '').trim();
+    const task = String(row[idxTask] || '').trim();
+    
+    let date = row[idxDate];
+    if (date instanceof Date) {
+      date = Utilities.formatDate(date, Session.getScriptTimeZone(), 'dd.MM.yyyy');
     } else {
-      Logger.log('⚠️ Неизвестная форма: ' + title);
+      date = String(date || '').trim();
     }
-  } catch (error) {
-    Logger.log('❌ Ошибка onFormSubmit: ' + error.toString());
+
+    const points = String(row[idxPoints] || '').trim();
+    const link = String(row[idxLink] || '').trim();
+    
+    let createdAt = row[0];
+    if (createdAt instanceof Date) {
+      createdAt = Utilities.formatDate(createdAt, Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm:ss');
+    } else {
+      createdAt = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm:ss');
+    }
+
+    if (!subject && !task) continue;
+
+    // Deadlines (Subject, Task, Date, Points, Link)
+    if (deadlinesSheet) {
+      deadlinesSheet.appendRow([subject, task, date, points, link]);
+    }
+
+    // Homework_Pool (ID, Subject, Task_Description, Deadline_Date, Created_At)
+    if (hwPoolSheet) {
+      const hwId = 'HW-' + String(hwCounter++).padStart(3, '0');
+      hwPoolSheet.appendRow([hwId, subject, task, date, createdAt]);
+    }
   }
 }
+function handleTeamFormSubmission(answers) {
+  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const projectsSheet = ss.getSheetByName('Projects');
+  
+  let parentSubject = '';
+  let parentDeadline = '';
+  let maxCapacity = 5;
 
-function handleAdminForm(e) {
-  try {
-    const values = e.values || [];
-    if (values.length < 6) {
-      Logger.log('⚠️ Админская форма пришла не в полном составе');
-      return;
+  // Находим исходную тему проекта и её дедлайн
+  if (projectsSheet) {
+    const pData = projectsSheet.getDataRange().getValues();
+    for (let i = 1; i < pData.length; i++) {
+      if (String(pData[i][0]).toUpperCase() === answers.project_id) {
+        parentSubject = pData[i][2] || '';
+        maxCapacity = pData[i][3] || 5;
+        parentDeadline = pData[i][7] || '';
+        if (parentDeadline instanceof Date) {
+          parentDeadline = Utilities.formatDate(parentDeadline, Session.getScriptTimeZone(), 'dd.MM.yyyy');
+        }
+        break;
+      }
     }
+  }
 
-    const projectName = String(values[1] || '').trim();
-    const subject = String(values[2] || '').trim();
-    const maxCapacity = Number(values[3]) || 0;
-    const deadline = String(values[4] || '').trim();
-    const leaderTelegramId = String(values[5] || '').trim();
+  // Регистрируем новую команду в Student_Projects
+  let studentProjSheet = ss.getSheetByName('Student_Projects') || ss.getSheetByName('Projects');
+  if (studentProjSheet) {
+    const teamId = (answers.project_id || 'PRJ-001') + '-T' + String(studentProjSheet.getLastRow());
+    const displayTitle = answers.team_name ? `${answers.team_name} (${answers.project_id})` : answers.project_name;
 
-    if (!projectName || !subject) {
-      Logger.log('⚠️ Недостаточно данных для создания проекта');
-      return;
-    }
-
-    const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
-    const sheet = ss.getSheetByName(SHEET_NAMES.projects);
-    if (!sheet) {
-      Logger.log('❌ Лист Projects не найден');
-      return;
-    }
-
-    const projectId = 'PRJ-' + Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyyMMdd-HHmmss');
-
-    sheet.appendRow([
-      projectId,
-      projectName,
-      subject,
-      maxCapacity,
-      0,
-      leaderTelegramId,
-      '',
-      deadline,
-      'Active'
+    studentProjSheet.appendRow([
+      teamId,                   // Project_ID / Team_ID
+      displayTitle,             // Project_Name (Название команды)
+      parentSubject,            // Subject
+      maxCapacity,              // Max_Capacity
+      1,                        // Current_Count (1 - Лидер)
+      answers.leader_tg,        // Leader_Telegram_ID
+      answers.leader_tg,        // Approved_Members
+      parentDeadline,           // Deadline
+      'Active'                  // Status
     ]);
 
-    Logger.log('✅ Проект добавлен: ' + projectId + ' / ' + projectName);
-
-    if (leaderTelegramId) {
-      sendTelegramMessage(
-        leaderTelegramId,
-        '✅ <b>Проект создан</b>\n\n' +
-        'Название: <b>' + esc(projectName) + '</b>\n' +
-        'ID: <b>' + projectId + '</b>\n' +
-        'Предмет: ' + esc(subject) + '\n' +
-        'Мест: ' + maxCapacity + '\n' +
-        'Дедлайн: ' + esc(deadline)
-      );
-    }
-  } catch (error) {
-    Logger.log('❌ Ошибка handleAdminForm: ' + error.toString());
+    // Уведомление в Telegram-группу о создании новой команды
+    const msg = `🎉 <b>НОВАЯ КОМАНДА НА САЙТЕ!</b>\n\n` +
+                `👥 <b>Команда:</b> ${answers.team_name || 'Без названия'}\n` +
+                `📁 <b>Проект:</b> ${answers.project_id}\n` +
+                `👑 <b>Лидер:</b> @${answers.leader_tg}\n` +
+                `📅 <b>Дедлайн:</b> ${parentDeadline}`;
+    sendTelegramNotification(msg, TELEGRAM_TOPIC_REQUESTS);
   }
 }
 
-function handleStudentForm(e) {
-  try {
-    const values = e.values || [];
-    if (values.length < 5) {
-      Logger.log('⚠️ Студенческая форма пришла не в полном составе');
-      return;
-    }
+function handleProjectCreationSubmission(answers, sheetName) {
+  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const sheetProjects = ss.getSheetByName(SHEET_NAMES.projects);
+  if (!sheetProjects) throw new Error('Лист "Projects" не найден!');
 
-    const projectName = String(values[1] || '').trim();
-    const subject = String(values[2] || '').trim();
-    const maxCapacity = Number(values[3]) || 0;
-    const leaderTelegramId = String(values[4] || '').trim();
+  const projectId = generateNextProjectId(sheetProjects);
 
-    if (!projectName || !subject || !leaderTelegramId) {
-      Logger.log('⚠️ Не заполнены обязательные поля формы создания команды');
-      return;
-    }
+  const newRow = [
+    projectId,
+    answers.project_name,
+    answers.subject || '—',
+    Number(answers.max_capacity) || 4,
+    1,
+    answers.leader_tg || 'ADMIN',
+    answers.leader_tg || 'ADMIN',
+    answers.deadline || '30.12.2026',
+    'Active'
+  ];
 
-    const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
-    const sheet = ss.getSheetByName(SHEET_NAMES.projects);
-    if (!sheet) {
-      Logger.log('❌ Лист Projects не найден');
-      return;
-    }
-
-    const projectId = 'PRJ-STU-' + Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyyMMdd-HHmmss');
-
-    sheet.appendRow([
-      projectId,
-      projectName,
-      subject,
-      maxCapacity,
-      1,
-      leaderTelegramId,
-      leaderTelegramId,
-      '',
-      'Active'
-    ]);
-
-    sendTelegramMessage(
-      leaderTelegramId,
-      '🎉 <b>Команда создана</b>\n\n' +
-      'Проект: <b>' + esc(projectName) + '</b>\n' +
-      'ID: <b>' + projectId + '</b>\n' +
-      'Предмет: ' + esc(subject) + '\n' +
-      'Мест: ' + maxCapacity + '\n\n' +
-      'Теперь студенты могут подавать заявки на вступление.'
-    );
-
-    Logger.log('✅ Команда создана студентом: ' + projectId);
-  } catch (error) {
-    Logger.log('❌ Ошибка handleStudentForm: ' + error.toString());
-  }
+  sheetProjects.appendRow(newRow);
 }
 
-function handleJoinRequestForm(e) {
-  try {
-    const values = e.values || [];
-    if (values.length < 4) {
-      Logger.log('⚠️ Форма заявки пришла не в полном составе');
-      return;
+function handleJoinRequestSubmission(answers) {
+  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const joinSheet = ss.getSheetByName('Join_Requests');
+  const projectsSheet = ss.getSheetByName('Projects') || ss.getSheetByName('Student_Projects');
+
+  let matchedDeadline = '';
+  let matchedProjectName = answers.project_id;
+
+  if (projectsSheet) {
+    const data = projectsSheet.getDataRange().getValues();
+    for (let i = 1; i < data.length; i++) {
+      if (String(data[i][0]).toUpperCase() === String(answers.project_id).toUpperCase()) {
+        matchedProjectName = data[i][1];
+        matchedDeadline = data[i][7];
+        if (matchedDeadline instanceof Date) {
+          matchedDeadline = Utilities.formatDate(matchedDeadline, Session.getScriptTimeZone(), 'dd.MM.yyyy');
+        }
+        break;
+      }
     }
+  }
 
-    const projectId = String(values[1] || '').trim();
-    const studentTelegramId = String(values[2] || '').trim();
-    const studentName = String(values[3] || '').trim();
+  if (joinSheet) {
+    const reqId = 'REQ-' + String(joinSheet.getLastRow()).padStart(3, '0');
+    const createdAt = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm');
+    const cleanTg = String(answers.student_tg || '').replace(/^@/, '').trim();
 
-    if (!projectId || !studentTelegramId) {
-      Logger.log('⚠️ В заявке отсутствуют обязательные поля');
-      return;
-    }
-
-    const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
-    const joinSheet = ss.getSheetByName(SHEET_NAMES.joinRequests);
-    if (!joinSheet) {
-      Logger.log('❌ Лист Join_Requests не найден');
-      return;
-    }
-
-    const requestId = 'REQ-' + Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyyMMdd-HHmmss');
-
+    // Запись строго по вашим колонкам:
+    // A: Request_ID | B: Project_ID | C: Student_Telegram_ID | D: Student_Name | E: Status | F: Created_At | G: Deadline
     joinSheet.appendRow([
-      requestId,
-      projectId,
-      studentTelegramId,
-      studentName,
-      'Pending'
+      reqId,
+      answers.project_id,
+      cleanTg,
+      answers.student_name || 'Участник',
+      'Pending',
+      createdAt,
+      matchedDeadline
     ]);
 
-    const projectsSheet = ss.getSheetByName(SHEET_NAMES.projects);
-    const projectsData = projectsSheet.getDataRange().getValues();
+    // Уведомление в ветку ЗАЯВОК в Telegram
+    const notifyText = 
+      `📥 <b>НОВАЯ ЗАЯВКА С САЙТА!</b>\n\n` +
+      `🆔 <b>ID Заявки:</b> <code>${reqId}</code>\n` +
+      `📁 <b>Команда/Проект:</b> ${esc(matchedProjectName)} (<code>${esc(answers.project_id)}</code>)\n` +
+      `👤 <b>Заявитель:</b> ${esc(answers.student_name || 'Участник')}\n` +
+      `💬 <b>Telegram:</b> @${esc(cleanTg)}`;
 
-    let leaderTelegramId = '';
-    let projectName = '';
+    const buttons = [[
+      { text: '✅ Принять', callback_data: 'app_' + reqId },
+      { text: '❌ Отклонить', callback_data: 'rej_' + reqId }
+    ]];
+    sendTelegramNotificationWithButtons(notifyText, TELEGRAM_TOPIC_REQUESTS, buttons);
+  }
+}
 
-    for (let i = 1; i < projectsData.length; i++) {
-      if (String(projectsData[i][0]).trim() === String(projectId).trim()) {
-        leaderTelegramId = String(projectsData[i][5] || '').trim();
-        projectName = String(projectsData[i][1] || '').trim();
+function notifyLeaderAboutRequest(projectId, requestId, studentTg, studentName) {
+  try {
+    const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+    const sheetProjects = ss.getSheetByName(SHEET_NAMES.projects);
+    const data = sheetProjects.getDataRange().getValues();
+
+    let leaderId = null;
+    let projectName = projectId;
+
+    for (let i = 1; i < data.length; i++) {
+      if (String(data[i][0]).trim() === String(projectId).trim()) {
+        projectName = data[i][1];
+        leaderId = data[i][5];
         break;
       }
     }
 
-    if (leaderTelegramId) {
-      const buttons = [[
-        { text: '✅ Принять', callback_data: 'approve_' + requestId },
-        { text: '❌ Отклонить', callback_data: 'reject_' + requestId }
-      ]];
+    if (!leaderId || leaderId === 'ADMIN') return;
 
-      sendTelegramMessageWithButtons(
-        leaderTelegramId,
-        '📩 <b>Новая заявка на вступление</b>\n\n' +
-        'Студент: <b>' + esc(studentName) + '</b>\n' +
-        'Проект: <b>' + esc(projectName) + '</b>\n' +
-        'Request ID: ' + requestId,
-        buttons
-      );
+    const message = `📥 <b>Новая заявка в вашу команду!</b>\n\n` +
+                    `📌 <b>Проект:</b> ${projectName} (${projectId})\n` +
+                    `👤 <b>Заявитель:</b> ${studentName} (ID: <code>${studentTg}</code>)\n\n` +
+                    `Принять студента в команду?`;
+
+    const buttons = [
+      { text: "✅ Принять", callback_data: "app_" + requestId },
+      { text: "❌ Отклонить", callback_data: "rej_" + requestId }
+    ];
+
+    sendTelegramMessageWithButtons(leaderId, message, [buttons]);
+  } catch (err) {
+    Logger.log('❌ Ошибка отправки уведомления лидеру: ' + err.toString());
+  }
+}
+
+function onSheetEdit(e) {
+  try {
+    if (!e || !e.range) return;
+    if (e.range.getSheet().getName() === SHEET_NAMES.projects) {
+      recalculateProjectCounts();
+      updateFormProjectOptions();
     }
-
-    sendTelegramMessage(
-      studentTelegramId,
-      '📨 <b>Заявка отправлена</b>\n\n' +
-      'Проект: <b>' + esc(projectName) + '</b>\n' +
-      'Статус: ожидание решения лидера.'
-    );
-
-    Logger.log('✅ Заявка создана: ' + requestId);
   } catch (error) {
-    Logger.log('❌ Ошибка handleJoinRequestForm: ' + error.toString());
+    Logger.log('❌ Ошибка в onSheetEdit: ' + error.toString());
   }
 }
 
 // ============================================================
-// 3. Spreadsheet data reading logic for Telegram questions
+// 4. Data Processing Helpers
 // ============================================================
+
+function generateNextProjectId(sheet) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow <= 1) return 'PRJ-001';
+
+  const ids = sheet.getRange(2, 1, lastRow - 1, 1).getValues();
+  let maxNum = 0;
+
+  ids.forEach(row => {
+    const match = String(row[0]).match(/PRJ-(\d+)/i);
+    if (match) {
+      const num = parseInt(match[1], 10);
+      if (num > maxNum) maxNum = num;
+    }
+  });
+
+  return 'PRJ-' + String(maxNum + 1).padStart(3, '0');
+}
 
 function getSheetData(sheetName) {
   const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
@@ -591,33 +878,79 @@ function getSheetData(sheetName) {
   return rows;
 }
 
+function getDeadlinesForWebsite() {
+  let deadlines = getSheetData(SHEET_NAMES.deadlines);
+  if (!deadlines || deadlines.length === 0) {
+    deadlines = getSheetData(SHEET_NAMES.homeworkPool);
+  }
+  return deadlines;
+}
+
+function getProjectsForWebsite() {
+  try {
+    const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+    
+    // Считываем действующие команды из Student_Projects.
+    // Если лист пуст, считываем темы из Projects.
+    let targetSheet = ss.getSheetByName(SHEET_NAMES.studentProjects);
+    if (!targetSheet || targetSheet.getLastRow() < 2) {
+      targetSheet = ss.getSheetByName(SHEET_NAMES.projects);
+    }
+    if (!targetSheet) return [];
+
+    const rows = targetSheet.getDataRange().getValues();
+    const result = [];
+
+    for (let i = 1; i < rows.length; i++) {
+      if (!rows[i][0] && !rows[i][1]) continue;
+
+      // Фильтр: пропуск сырых ответов Google Форм, если в первой колонке дата/время
+      const firstCell = String(rows[i][0] || '').trim();
+      if (firstCell.includes('.') && firstCell.includes(':')) continue;
+
+      const status = String(rows[i][8] || 'Active').trim().toLowerCase();
+      if (status === 'closed' || status === 'expired' || status === 'archived' || status === 'inactive') continue;
+
+      const maxCapacity = Number(rows[i][3]) || 0;
+      const currentCount = Number(rows[i][4]) || 0;
+
+      result.push({
+        projectId: String(rows[i][0] || '').trim(),
+        projectName: String(rows[i][1] || '').trim(),
+        subject: String(rows[i][2] || '').trim(),
+        maxCapacity: maxCapacity,
+        currentCount: currentCount,
+        leaderTelegramId: String(rows[i][5] || '').trim(),
+        approvedMembers: String(rows[i][6] || '').trim(),
+        deadline: String(rows[i][7] || '').trim(),
+        availableSpots: Math.max(0, maxCapacity - currentCount),
+        status: status
+      });
+    }
+
+    return result;
+  } catch (error) {
+    Logger.log('❌ Ошибка getProjectsForWebsite: ' + error.toString());
+    return [];
+  }
+}
+
 function processUserQuery(userMessage) {
   try {
     const query = String(userMessage || '').trim();
-    if (!query) {
-      return '❓ Напишите вопрос, например: «Что задавали по математике?»';
-    }
+    if (!query) return '❓ Напишите вопрос, например: «Что задавали по математике?»';
 
     const normalized = query.toLowerCase();
 
     if (normalized.includes('проект') || normalized.includes('команда') || normalized.includes('группа')) {
       return findProjectsForTelegram();
     }
-
     if (normalized.includes('расписан') || normalized.includes('занят') || normalized.includes('когда')) {
       return findScheduleForTelegram();
     }
-
     if (
-      normalized.includes('дз') ||
-      normalized.includes('домаш') ||
-      normalized.includes('задан') ||
-      normalized.includes('задавали') ||
-      normalized.includes('дедлайн') ||
-      normalized.includes('по ') ||
-      normalized.includes('матем') ||
-      normalized.includes('физик') ||
-      normalized.includes('русск')
+      normalized.includes('дз') || normalized.includes('домаш') ||
+      normalized.includes('задан') || normalized.includes('дедлайн') || normalized.includes('по ')
     ) {
       return findHomeworkForTelegram(query);
     }
@@ -625,7 +958,7 @@ function processUserQuery(userMessage) {
     return '❓ Я не понял ваш вопрос. Попробуйте: «Что задавали по математике?» или «Какие проекты есть?»';
   } catch (error) {
     Logger.log('❌ Ошибка processUserQuery: ' + error.toString());
-    return '❌ Не удалось обработать запрос. Попробуйте позже.';
+    return '❌ Не удалось обработать запрос.';
   }
 }
 
@@ -635,7 +968,7 @@ function findHomeworkForTelegram(query) {
     const rows = [];
 
     const hwRows = getSheetData(SHEET_NAMES.homeworkPool);
-    hwRows.forEach(function (row) {
+    hwRows.forEach(row => {
       const rowSubject = String(row.Subject || '').trim();
       const status = String(row.Status || 'Active').trim().toLowerCase();
 
@@ -650,38 +983,20 @@ function findHomeworkForTelegram(query) {
     });
 
     if (rows.length === 0) {
-      const deadlineRows = getSheetData(SHEET_NAMES.deadlines);
-      deadlineRows.forEach(function (row) {
-        const rowSubject = String(row.Subject || '').trim();
-        if (subject && rowSubject.toLowerCase().indexOf(subject.toLowerCase()) === -1) return;
-        rows.push({
-          subject: rowSubject,
-          task: row.Task || row.Task_Description || '',
-          date: row.Date || row.Deadline_Date || ''
-        });
-      });
-    }
-
-    if (rows.length === 0) {
       return subject
         ? '📋 По предмету «' + esc(subject) + '» заданий не найдено.'
         : '📋 Заданий пока не найдено.';
     }
 
     let result = '📚 <b>Найдены задания:</b>\n\n';
-    rows.slice(0, 10).forEach(function (r, index) {
+    rows.slice(0, 10).forEach((r, index) => {
       result += (index + 1) + '. <b>[' + esc(r.subject || 'Без предмета') + ']</b>: ' + esc(r.task || 'Без текста');
       if (r.date) result += ' — <i>' + esc(r.date) + '</i>';
       result += '\n';
     });
 
-    if (rows.length > 10) {
-      result += '\n... и ещё ' + (rows.length - 10) + ' записей';
-    }
-
     return result;
   } catch (error) {
-    Logger.log('❌ Ошибка findHomeworkForTelegram: ' + error.toString());
     return '❌ Не удалось прочитать данные из таблицы.';
   }
 }
@@ -689,50 +1004,40 @@ function findHomeworkForTelegram(query) {
 function findScheduleForTelegram() {
   try {
     const rows = getSheetData(SHEET_NAMES.schedule);
-    if (!rows.length) {
-      return '📅 Расписание пока не найдено.';
-    }
+    if (!rows.length) return '📅 Расписание пока не найдено.';
 
     let result = '📅 <b>Расписание:</b>\n\n';
-    rows.slice(0, 15).forEach(function (r, index) {
-      result += (index + 1) + '. <b>' + esc(r.Day || 'День') + '</b> — ' + esc(r.Subject || 'Предмет') + ' (' + esc(r.Time || 'Время') + ')';
-      if (r.Task) result += ' — ' + esc(r.Task);
-      result += '\n';
+    rows.slice(0, 15).forEach((r, index) => {
+      result += (index + 1) + '. <b>' + esc(r.Day || 'День') + '</b> — ' + esc(r.Subject || 'Предмет') + ' (' + esc(r.Time || 'Время') + ')\n';
     });
 
     return result;
   } catch (error) {
-    Logger.log('❌ Ошибка findScheduleForTelegram: ' + error.toString());
     return '❌ Не удалось прочитать расписание.';
   }
 }
 
 function findProjectsForTelegram() {
   try {
-    const rows = getSheetData(SHEET_NAMES.projects).filter(function (row) {
+    const rows = getSheetData(SHEET_NAMES.projects).filter(row => {
       const status = String(row.Status || 'Active').trim().toLowerCase();
       return status !== 'expired' && status !== 'archived' && status !== 'closed';
     });
 
-    if (!rows.length) {
-      return '📦 Активных проектов пока нет.';
-    }
+    if (!rows.length) return '📦 Активных проектов пока нет.';
 
     let result = '📦 <b>Активные проекты:</b>\n\n';
-    rows.slice(0, 10).forEach(function (row, index) {
+    rows.slice(0, 10).forEach((row, index) => {
       const currentCount = Number(row.Current_Count) || 0;
       const maxCapacity = Number(row.Max_Capacity) || 0;
       const freePlaces = Math.max(0, maxCapacity - currentCount);
       result += (index + 1) + '. <b>' + esc(row.Project_Name || 'Без названия') + '</b>\n';
       result += '   📚 ' + esc(row.Subject || 'Предмет') + '\n';
-      result += '   👥 Свободно: ' + freePlaces + '/' + maxCapacity + '\n';
-      if (row.Deadline) result += '   📅 ' + esc(row.Deadline) + '\n';
-      result += '\n';
+      result += '   👥 Свободно: ' + freePlaces + '/' + maxCapacity + '\n\n';
     });
 
     return result;
   } catch (error) {
-    Logger.log('❌ Ошибка findProjectsForTelegram: ' + error.toString());
     return '❌ Не удалось прочитать проекты.';
   }
 }
@@ -742,117 +1047,86 @@ function extractSubjectFromQuery(query) {
     const text = String(query || '').toLowerCase();
     const match = text.match(/по\s+([а-яёa-z0-9\-_ ]+)/i);
     if (!match) return '';
-
-    let subject = match[1].trim();
-    subject = subject.replace(/\s+(что|задали|задавали|домашка|дз|сегодня|сейчас)$/i, '');
-    return subject;
+    return match[1].trim().replace(/\s+(что|задали|задавали|домашка|дз|сегодня|сейчас)$/i, '');
   } catch (error) {
-    Logger.log('❌ Ошибка extractSubjectFromQuery: ' + error.toString());
     return '';
   }
 }
 
 // ============================================================
-// 4. Telegram API helpers
+// 5. External Integration & Recalculations
 // ============================================================
 
-function sendTelegramMessage(chatId, text) {
-  const url = 'https://api.telegram.org/bot' + BOT_TOKEN + '/sendMessage';
-  const payload = {
-    chat_id: String(chatId),
-    text: text,
-    parse_mode: 'HTML'
-  };
-
-  UrlFetchApp.fetch(url, {
-    method: 'post',
-    contentType: 'application/json',
-    payload: JSON.stringify(payload),
-    muteHttpExceptions: true
-  });
-}
-
-function sendTelegramMessageWithButtons(chatId, text, buttons) {
-  const url = 'https://api.telegram.org/bot' + BOT_TOKEN + '/sendMessage';
-  const payload = {
-    chat_id: String(chatId),
-    text: text,
-    parse_mode: 'HTML',
-    reply_markup: {
-      inline_keyboard: buttons
-    }
-  };
-
-  UrlFetchApp.fetch(url, {
-    method: 'post',
-    contentType: 'application/json',
-    payload: JSON.stringify(payload),
-    muteHttpExceptions: true
-  });
-}
-
-function answerCallbackQuery(callbackId, text, showAlert) {
-  const url = 'https://api.telegram.org/bot' + BOT_TOKEN + '/answerCallbackQuery';
-  const payload = {
-    callback_query_id: callbackId,
-    text: text,
-    show_alert: !!showAlert
-  };
-
-  UrlFetchApp.fetch(url, {
-    method: 'post',
-    contentType: 'application/json',
-    payload: JSON.stringify(payload),
-    muteHttpExceptions: true
-  });
-}
-
-// ============================================================
-// 5. Website / API for mini app
-// ============================================================
-
-function getProjectsForWebsite() {
+function recalculateProjectCounts() {
   try {
     const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
-    const projectsSheet = ss.getSheetByName(SHEET_NAMES.projects);
-    if (!projectsSheet) return [];
+    const projSheet = ss.getSheetByName(SHEET_NAMES.projects);
+    const reqSheet = ss.getSheetByName(SHEET_NAMES.joinRequests);
 
-    const rows = projectsSheet.getDataRange().getValues();
-    const result = [];
+    if (!projSheet || !reqSheet) return;
 
-    for (let i = 1; i < rows.length; i++) {
-      const status = String(rows[i][8] || 'Active').trim().toLowerCase();
-      if (status === 'closed' || status === 'expired' || status === 'archived') continue;
+    const projData = projSheet.getDataRange().getValues();
+    const reqData = reqSheet.getDataRange().getValues();
 
-      const projectId = String(rows[i][0] || '').trim();
-      const projectName = String(rows[i][1] || '').trim();
-      const subject = String(rows[i][2] || '').trim();
-      const maxCapacity = Number(rows[i][3]) || 0;
-      const currentCount = Number(rows[i][4]) || 0;
-      const leaderTelegramId = String(rows[i][5] || '').trim();
-      const approvedMembers = String(rows[i][6] || '').trim();
-      const deadline = String(rows[i][7] || '').trim();
+    if (projData.length < 2) return;
 
-      const membersList = approvedMembers ? approvedMembers.split(',').map(v => String(v).trim()).filter(Boolean) : [];
-
-      result.push({
-        projectId: projectId,
-        projectName: projectName,
-        subject: subject,
-        maxCapacity: maxCapacity,
-        currentCount: currentCount,
-        leaderTelegramId: leaderTelegramId,
-        approvedMembers: membersList,
-        deadline: deadline,
-        availableSpots: Math.max(0, maxCapacity - currentCount),
-        status: status
-      });
+    const counts = {};
+    for (let i = 1; i < reqData.length; i++) {
+      const pId = String(reqData[i][1] || '').trim();
+      const status = String(reqData[i][4] || '').trim();
+      if (pId && status === 'Approved') {
+        counts[pId] = (counts[pId] || 0) + 1;
+      }
     }
 
-    return result;
+    for (let i = 1; i < projData.length; i++) {
+      const pId = String(projData[i][0]).trim();
+      if (pId) {
+        const approvedCount = (counts[pId] || 0) + 1; // +1 лидер
+        projSheet.getRange(i + 1, 5).setValue(approvedCount);
+      }
+    }
+
+    SpreadsheetApp.flush();
   } catch (error) {
-    Logger.log('❌ Ошибка getProjectsForWebsite: ' + error.toString());
-    return [];
+    Logger.log('❌ Ошибка в recalculateProjectCounts: ' + error.toString());
+  }
+}
+
+function updateFormProjectOptions() {
+  try {
+    const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+    const projSheet = ss.getSheetByName(SHEET_NAMES.projects);
+    if (!projSheet) return;
+
+    const data = projSheet.getDataRange().getValues();
+    if (data.length < 2) return;
+
+    const activeProjects = [];
+    for (let i = 1; i < data.length; i++) {
+      const pId = String(data[i][0]).trim();
+      const name = String(data[i][1]).trim();
+      const maxCap = Number(data[i][3]) || 0;
+      const curCount = Number(data[i][4]) || 0;
+      const status = String(data[i][8] || 'Active').trim();
+
+      if (name && status === 'Active' && curCount < maxCap) {
+        activeProjects.push(`${name} (${pId})`);
+      }
+    }
+
+    const form = FormApp.openById(CONFIG.TEAM_FORM_ID);
+    const items = form.getItems();
+
+    for (let i = 0; i < items.length; i++) {
+      if (items[i].getTitle() === CONFIG.PROJECT_QUESTION_TITLE) {
+        const listItem = items[i].asListItem();
+        listItem.setChoiceValues(activeProjects.length > 0 ? activeProjects : ['Нет доступных проектов']);
+        break;
+      }
+    }
+  } catch (error) {
+    Logger.log('❌ Ошибка updateFormProjectOptions: ' + error.toString());
   }
 }
 
@@ -864,25 +1138,15 @@ function handleWebsiteProjectRequest(data) {
     const deadline = String(data.deadline || '').trim();
     const leaderTelegramId = String(data.leaderTelegramId || '').trim();
 
-    if (!name || !subject || !leaderTelegramId) {
-      Logger.log('⚠️ Некорректный запрос addProject');
-      return;
-    }
+    if (!name || !subject || !leaderTelegramId) return;
 
     const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
     const sheet = ss.getSheetByName(SHEET_NAMES.projects);
     const projectId = 'PRJ-' + Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyyMMdd-HHmmss');
 
     sheet.appendRow([
-      projectId,
-      name,
-      subject,
-      maxCapacity,
-      1,
-      leaderTelegramId,
-      leaderTelegramId,
-      deadline,
-      'Active'
+      projectId, name, subject, maxCapacity, 1,
+      leaderTelegramId, leaderTelegramId, deadline, 'Active'
     ]);
 
     sendTelegramMessage(
@@ -897,7 +1161,7 @@ function handleWebsiteProjectRequest(data) {
 }
 
 // ============================================================
-// 6. Utility functions
+// 6. Telegram API & Setup Utilities
 // ============================================================
 
 function esc(str) {
@@ -907,347 +1171,115 @@ function esc(str) {
     .replace(/>/g, '&gt;');
 }
 
+function sendTelegramMessage(chatId, text) {
+  UrlFetchApp.fetch('https://api.telegram.org/bot' + BOT_TOKEN + '/sendMessage', {
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify({ chat_id: String(chatId), text: text, parse_mode: 'HTML' }),
+    muteHttpExceptions: true
+  });
+}
+
+function sendTelegramMessageWithButtons(chatId, text, buttons) {
+  UrlFetchApp.fetch('https://api.telegram.org/bot' + BOT_TOKEN + '/sendMessage', {
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify({
+      chat_id: String(chatId),
+      text: text,
+      parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: buttons }
+    }),
+    muteHttpExceptions: true
+  });
+}
+
+function answerCallbackQuery(callbackId, text, showAlert) {
+  UrlFetchApp.fetch('https://api.telegram.org/bot' + BOT_TOKEN + '/answerCallbackQuery', {
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify({ callback_query_id: callbackId, text: text, show_alert: !!showAlert }),
+    muteHttpExceptions: true
+  });
+}
+
+function logErrorToSheet(functionName, errorMessage) {
+  try {
+    const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+    let logSheet = ss.getSheetByName('Logs') || ss.insertSheet('Logs');
+    logSheet.appendRow([new Date(), functionName, errorMessage]);
+  } catch (e) {
+    Logger.log('Ошибка записи лога: ' + e.toString());
+  }
+}
+
+function setupAllTriggers() {
+  clearAllTriggers();
+  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+
+  ScriptApp.newTrigger('onSheetEdit').forSpreadsheet(ss).onEdit().create();
+  ScriptApp.newTrigger('onFormSubmit').forSpreadsheet(ss).onFormSubmit().create();
+  ScriptApp.newTrigger('updateFormProjectOptions').timeBased().everyHours(1).create();
+
+  setupWebhook();
+}
+
+function clearAllTriggers() {
+  const triggers = ScriptApp.getProjectTriggers();
+  for (let i = 0; i < triggers.length; i++) {
+    ScriptApp.deleteTrigger(triggers[i]);
+  }
+}
+
 function setupWebhook() {
   try {
     const telegramApiUrl = 'https://api.telegram.org/bot' + BOT_TOKEN + '/setWebhook?url=' + encodeURIComponent(WEBHOOK_URL);
     const response = UrlFetchApp.fetch(telegramApiUrl, { muteHttpExceptions: true });
-    Logger.log('🔗 Результат установки вебхука: ' + response.getContentText());
+    Logger.log('🔗 Вебхук установлен: ' + response.getContentText());
   } catch (error) {
     Logger.log('❌ Ошибка setupWebhook: ' + error.toString());
   }
 }
 
-function checkWebhookInfo() {
-  try {
-    const response = UrlFetchApp.fetch('https://api.telegram.org/bot' + BOT_TOKEN + '/getWebhookInfo', { muteHttpExceptions: true });
-    Logger.log('🔗 Webhook info: ' + response.getContentText());
-  } catch (error) {
-    Logger.log('❌ Ошибка checkWebhookInfo: ' + error.toString());
-  }
-}
-
-function deleteWebhook() {
-  try {
-    const response = UrlFetchApp.fetch('https://api.telegram.org/bot' + BOT_TOKEN + '/deleteWebhook?drop_pending_updates=true', { muteHttpExceptions: true });
-    Logger.log('🗑️ deleteWebhook: ' + response.getContentText());
-  } catch (error) {
-    Logger.log('❌ Ошибка deleteWebhook: ' + error.toString());
-  }
-}
-
-// ============================================================
-// 7. Legacy helper functions for compatibility
-// ============================================================
-
-function setupSheets() {
-  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
-  ensureSheet(ss, SHEET_NAMES.projects, ['Project_ID', 'Project_Name', 'Subject', 'Max_Capacity', 'Current_Count', 'Leader_Telegram_ID', 'Approved_Members', 'Deadline', 'Status']);
-  ensureSheet(ss, SHEET_NAMES.joinRequests, ['Request_ID', 'Project_ID', 'Student_Telegram_ID', 'Student_Name', 'Status']);
-  ensureSheet(ss, SHEET_NAMES.adminIds, ['Telegram_ID']);
-  ensureSheet(ss, SHEET_NAMES.homeworkPool, ['ID', 'Subject', 'Task_Description', 'Deadline_Date', 'Created_At', 'Status']);
-  ensureSheet(ss, SHEET_NAMES.deadlines, ['Subject', 'Task', 'Date', 'Type', 'Credits', 'Points', 'Link']);
-  ensureSheet(ss, SHEET_NAMES.schedule, ['Day', 'Time', 'Subject', 'Task', 'WeekType', 'Type']);
-  ensureSheet(ss, SHEET_NAMES.groups, ['Group', 'Members']);
-  ensureSheet(ss, SHEET_NAMES.syllabus, ['Subject', 'Theme']);
-  ensureSheet(ss, SHEET_NAMES.studentProjects, ['Telegram_ID', 'Student_Name', 'Subject', 'Project_Name', 'Timestamp']);
-}
-
-function ensureSheet(ss, name, headers) {
-  let sheet = ss.getSheetByName(name);
-  if (!sheet) {
-    sheet = ss.insertSheet(name);
-    sheet.appendRow(headers);
-    sheet.setFrozenRows(1);
-  }
-}
-
-function updateExpiredStatuses() {
-  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
-  const todayStr = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd');
-  const projSheet = ss.getSheetByName(SHEET_NAMES.projects);
-  if (!projSheet) return;
-
-  const rows = projSheet.getDataRange().getValues();
-  if (rows.length < 2) return;
-
-  const headers = rows[0].map(h => String(h).trim());
-  const deadlineIndex = headers.indexOf('Deadline');
-  let statusIndex = headers.indexOf('Status');
-
-  if (statusIndex === -1) {
-    statusIndex = headers.length;
-    projSheet.getRange(1, statusIndex + 1).setValue('Status');
-  }
-
-  for (let i = 1; i < rows.length; i++) {
-    const rowDate = String(rows[i][deadlineIndex] || '').trim();
-    const currentStatus = String(rows[i][statusIndex] || '').trim();
-
-    if (rowDate && rowDate < todayStr && currentStatus !== 'Expired' && currentStatus !== 'Archived') {
-      projSheet.getRange(i + 1, statusIndex + 1).setValue('Expired');
-    }
-  }
-}
-
-function getMondayOf(date) {
-  const d = new Date(date);
-  const day = d.getDay();
-  const diff = (day === 0 ? -6 : 1) - day;
-  d.setDate(d.getDate() + diff);
-  d.setHours(0, 0, 0, 0);
-  return d;
-}
-
-function getWeekTypeForDate(date) {
-  const anchorMonday = getMondayOf(new Date(SCHEDULE_ANCHOR_MONDAY + 'T00:00:00'));
-  const targetMonday = getMondayOf(date);
-  const diffWeeks = Math.round((targetMonday - anchorMonday) / (7 * 24 * 60 * 60 * 1000));
-  const parity = ((diffWeeks % 2) + 2) % 2;
-  return parity === 0 ? SCHEDULE_ANCHOR_WEEK_TYPE : (SCHEDULE_ANCHOR_WEEK_TYPE === 1 ? 2 : 1);
-}
-
-function getTasksForDate(date) {
-  const dateStr = Utilities.formatDate(date, Session.getScriptTimeZone(), 'yyyy-MM-dd');
-  const dayName = DAY_NAMES[date.getDay()];
-  const weekType = getWeekTypeForDate(date);
-  const tasks = [];
-
-  getSheetData(SHEET_NAMES.schedule).forEach(function (row) {
-    const type = String(row.Type || '').toLowerCase();
-    const isDeadlineType = type.indexOf('дедлайн') > -1 || type.indexOf('дз') > -1 || type.indexOf('deadline') > -1;
-    if (!isDeadlineType) return;
-    if (String(row.Day || '').trim() !== dayName) return;
-    if (Number(row.WeekType) !== weekType) return;
-    tasks.push({ subject: row.Subject || '', task: row.Task || '', due: dateStr });
-  });
-
-  getSheetData(SHEET_NAMES.homeworkPool).forEach(function (row) {
-    if (String(row.Deadline_Date || '').trim() === dateStr) {
-      tasks.push({ subject: row.Subject || '', task: row.Task_Description || '', due: dateStr });
-    }
-  });
-
-  return tasks;
-}
-
-function checkAndSend3DayReminders() {
-  const target = new Date();
-  target.setDate(target.getDate() + 3);
-  const tasks = getTasksForDate(target);
-
-  if (!tasks.length) return;
-
-  let message = '⏰ <b>Напоминание: через 3 дня:</b>\n\n';
-  tasks.forEach(function (task, index) {
-    message += (index + 1) + '. <b>[' + esc(task.subject) + ']</b>: ' + esc(task.task) + ' (' + task.due + ')\n';
-  });
-
-  sendTelegramMessage(CHAT_ID, message);
-}
-
-function firstValue(namedValues, keys) {
-  for (let i = 0; i < keys.length; i++) {
-    if (namedValues[keys[i]] && namedValues[keys[i]][0]) {
-      return namedValues[keys[i]][0];
-    }
-  }
-  return '';
-}
-
-function onSpreadsheetFormSubmit(e) {
-  if (!e || !e.range) return;
-
-  const sheetName = e.range.getSheet().getName();
-  const lock = LockService.getScriptLock();
-
-  if (lock.tryLock(10000)) {
-    try {
-      if (sheetName === CONFIG.SHEETS.RESPONSES_DEADLINES || sheetName.includes('Ответы на форму 1')) {
-        processDeadlineSubmission(e);
-      } else if (sheetName === CONFIG.SHEETS.RESPONSES_PROJECTS || sheetName.includes('Ответы на форму 2')) {
-        processTeamSubmission(e);
-      }
-    } catch (error) {
-      Logger.log('❌ Ошибка onSpreadsheetFormSubmit: ' + error.toString());
-    } finally {
-      lock.releaseLock();
-    }
-  }
-}
-
-function processDeadlineSubmission(e) {
-  const values = e.values;
-  if (!values || values.length < 4) return;
-
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sheet = ss.getSheetByName(CONFIG.SHEETS.DEADLINES);
-  if (!sheet) return;
-
-  let formattedDate = values[3];
-  if (values[3]) {
-    const parsed = new Date(values[3]);
-    if (!isNaN(parsed.getTime())) {
-      formattedDate = Utilities.formatDate(parsed, ss.getSpreadsheetTimeZone(), 'yyyy-MM-dd');
-    }
-  }
-
-  sheet.appendRow([values[1], values[2], formattedDate, values[4] || 'Дедлайн', values[5], values[6], values[7]]);
-}
-
-function processTeamSubmission(e) {
-  const values = e.values;
-  if (!values || values.length < 4) return;
-
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const projectsSheet = ss.getSheetByName(CONFIG.SHEETS.PROJECTS);
-  const studentProjectsSheet = ss.getSheetByName(CONFIG.SHEETS.STUDENT_PROJECTS);
-
-  const leaderName = String(values[1] || '').trim();
-  const subject = String(values[2] || '').trim();
-  const projectName = String(values[3] || '').trim();
-
-  const applicants = [leaderName, values[4], values[5], values[6]]
-    .map(v => String(v || '').trim())
-    .filter(v => v.length > 0);
-
-  if (!projectName || applicants.length === 0) return;
-
-  const projectsData = projectsSheet.getDataRange().getValues();
-  let projectRow = -1;
-  let maxCap = 0;
-  let curCount = 0;
-
-  for (let i = 1; i < projectsData.length; i++) {
-    if (String(projectsData[i][1]).trim() === projectName) {
-      projectRow = i + 1;
-      maxCap = Number(projectsData[i][3]) || 0;
-      curCount = Number(projectsData[i][4]) || 0;
-      break;
-    }
-  }
-
-  if (projectRow === -1) return;
-
-  const freeSpace = maxCap - curCount;
-  if (freeSpace > 0) {
-    const accepted = applicants.slice(0, freeSpace);
-    const now = new Date().toISOString();
-
-    accepted.forEach(student => {
-      studentProjectsSheet.appendRow(['', student, subject, projectName, now]);
-    });
-
-    const newCount = curCount + accepted.length;
-    projectsSheet.getRange(projectRow, 5).setValue(newCount);
-  }
-}
-
-// ============================================================
-// 8. Maintainers / compatibility constants
-// ============================================================
-
-const TEAM_FORM_ID = '1PCasYaKY3YepLZrwjBA272-kUZa4bDlVGThxP4mZ1b4';
-const PROJECT_QUESTION_TITLE = 'Выберите проект';
-
-function updateFormProjectOptions() {
-  try {
-    const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
-    const projSheet = ss.getSheetByName('Projects');
-    if (!projSheet) return;
-
-    const data = projSheet.getDataRange().getValues();
-    if (data.length < 2) return;
-
-    const activeProjects = [];
-    for (let i = 1; i < data.length; i++) {
-      const name = String(data[i][1]).trim();
-      const maxCap = Number(data[i][3]) || 0;
-      const curCount = Number(data[i][4]) || 0;
-      const status = String(data[i][8] || 'Active').trim();
-
-      if (name && status === 'Active' && curCount < maxCap) {
-        activeProjects.push(name);
-      }
-    }
-
-    const form = FormApp.openById(TEAM_FORM_ID);
-    const items = form.getItems();
-
-    for (let i = 0; i < items.length; i++) {
-      if (items[i].getTitle() === PROJECT_QUESTION_TITLE) {
-        const listItem = items[i].asListItem();
-        if (activeProjects.length > 0) {
-          listItem.setChoiceValues(activeProjects);
-        } else {
-          listItem.setChoiceValues(['Нет доступных проектов']);
-        }
-        break;
-      }
-    }
-  } catch (error) {
-    Logger.log('❌ Ошибка updateFormProjectOptions: ' + error.toString());
-  }
-}
-
-// ============================================================
-// End of file
-// ====================================
-
-
-
 
 /**
- * Функция однократной настройки структуры Google Таблицы.
- * Создаёт нужные листы, прописывает заголовки, закрепляет и форматирует первые строки.
+ * Функция отправки сообщения в Telegram-группу в конкретную тему (Topic)
+ * @param {string} text - Текст сообщения (поддерживает HTML)
+ * @param {number|null} topicId - ID темы (message_thread_id)
  */
-function setupSpreadsheetStructure() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
+function sendTelegramNotification(text, topicId = null) {
+  const payload = {
+    chat_id: TELEGRAM_CHAT_ID,
+    text: text,
+    parse_mode: 'HTML'
+  };
 
-  // 1. Настройка листа Projects (Основной реестр проектов)
-  let projectsSheet = ss.getSheetByName("Projects") || ss.insertSheet("Projects");
-  const projectsHeaders = [
-    "Project_ID", 
-    "Project_Name", 
-    "Subject", 
-    "Max_Capacity", 
-    "Current_Count", 
-    "Leader_Telegram_ID", 
-    "Approved_Members", 
-    "Deadline", 
-    "Status"
-  ];
-  setHeadersIfEmpty(projectsSheet, projectsHeaders);
+  // Если указана конкретная тема (топик) группы, добавляем message_thread_id
+  if (topicId) {
+    payload.message_thread_id = Number(topicId);
+  }
 
-  // 2. Настройка листа Join_Requests (Заявки студентов на вступление)
-  let requestsSheet = ss.getSheetByName("Join_Requests") || ss.insertSheet("Join_Requests");
-  const requestsHeaders = [
-    "Request_ID", 
-    "Project_ID", 
-    "Student_Telegram_ID", 
-    "Student_Name", 
-    "Status"
-  ];
-  setHeadersIfEmpty(requestsSheet, requestsHeaders);
-
-  // 3. Настройка листа Admin_IDs (Список Telegram ID администраторов)
-  let adminSheet = ss.getSheetByName("Admin_IDs") || ss.insertSheet("Admin_IDs");
-  const adminHeaders = ["Telegram_ID"];
-  setHeadersIfEmpty(adminSheet, adminHeaders);
-
-  Logger.log("✅ Все рабочие листы успешно созданы и подготовлены!");
+  UrlFetchApp.fetch('https://api.telegram.org/bot' + BOT_TOKEN + '/sendMessage', {
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  });
 }
 
-/**
- * Вспомогательная функция установки и форматирования заголовков
- */
-function setHeadersIfEmpty(sheet, headersArray) {
-  if (sheet.getLastRow() === 0) {
-    sheet.getRange(1, 1, 1, headersArray.length).setValues([headersArray]);
-  }
-  
-  // Красивое форматирование первой строки
-  const headerRange = sheet.getRange(1, 1, 1, headersArray.length);
-  headerRange.setFontWeight("bold");
-  headerRange.setBackground("#EFEFEF");
-  sheet.setFrozenRows(1);
+function sendTelegramNotificationWithButtons(text, topicId, buttons) {
+  const payload = {
+    chat_id: TELEGRAM_CHAT_ID,
+    text: text,
+    parse_mode: 'HTML',
+    reply_markup: { inline_keyboard: buttons }
+  };
+  if (topicId) payload.message_thread_id = Number(topicId);
+
+  UrlFetchApp.fetch('https://api.telegram.org/bot' + BOT_TOKEN + '/sendMessage', {
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  });
 }
